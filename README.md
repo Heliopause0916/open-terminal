@@ -117,6 +117,50 @@ Built-in multi-user mode separates workspaces inside one shared container; it do
 
 For separate containers per user, use [Terminals](https://github.com/open-webui/terminals). Production use requires an [Open WebUI Enterprise License](https://docs.openwebui.com/enterprise/). See the [security policy](SECURITY.md) for the trust model.
 
+## MCP Server
+
+Open Terminal ships with an [MCP](https://modelcontextprotocol.io) server that exposes every API endpoint as an MCP tool. Install the optional dependency first:
+
+```bash
+pip install "open-terminal[mcp]"
+```
+
+### stdio (local)
+
+For a local client, run the MCP server over standard input/output:
+
+```bash
+open-terminal mcp --transport stdio
+```
+
+The `stdio` transport communicates with the local process only, so no host, port, or bearer token is needed. If no API key is configured, one is generated automatically.
+
+### streamable-http (remote)
+
+To run the MCP server as a network service and connect from another machine:
+
+```bash
+open-terminal mcp --transport streamable-http --host 0.0.0.0 --port 8000 --api-key your-secret-key
+```
+
+Then connect from VS Code `mcp.json`:
+
+```json
+{
+  "servers": {
+    "open-terminal": {
+      "type": "http",
+      "url": "http://<server-ip>:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-api-key>"
+      }
+    }
+  }
+}
+```
+
+The `--api-key` flag (or `OPEN_TERMINAL_API_KEY` env var, or the file named by `OPEN_TERMINAL_API_KEY_FILE`, or `api_key` in a config file) is required for streamable-http — a random key is not generated for remote transports. The same key authenticates both the MCP server and the underlying REST API.
+
 ## Support
 
 [Open an issue](https://github.com/open-webui/open-terminal/issues) for bugs or setup problems. Report vulnerabilities privately through [GitHub Security Advisories](https://github.com/open-webui/open-terminal/security/advisories/new).

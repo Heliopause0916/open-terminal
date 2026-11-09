@@ -22,6 +22,32 @@ BANNER = r"""
 """
 
 
+def _resolve_api_key(api_key: str | None, cfg: dict) -> str:
+    """Resolve the API key from an explicit CLI flag, env var, secret file, or config.
+
+    Resolution order: ``--api-key`` (when passed on the command line), then
+    ``OPEN_TERMINAL_API_KEY`` (mutually exclusive with
+    ``OPEN_TERMINAL_API_KEY_FILE``), then the file named by
+    ``OPEN_TERMINAL_API_KEY_FILE``, then ``api_key`` from the TOML config.
+    """
+    explicit_key = click.get_current_context().get_parameter_source("api_key") == click.core.ParameterSource.COMMANDLINE
+    if not explicit_key:
+        file_path = os.environ.get("OPEN_TERMINAL_API_KEY_FILE")
+        if "OPEN_TERMINAL_API_KEY" in os.environ and "OPEN_TERMINAL_API_KEY_FILE" in os.environ:
+            raise click.UsageError("OPEN_TERMINAL_API_KEY and OPEN_TERMINAL_API_KEY_FILE are mutually exclusive.")
+        if "OPEN_TERMINAL_API_KEY" in os.environ:
+            api_key = os.environ["OPEN_TERMINAL_API_KEY"]
+        elif file_path:
+            try:
+                with open(file_path) as f:
+                    api_key = f.read().strip()
+            except (OSError, UnicodeError) as exc:
+                raise click.ClickException(f"Could not read API key file: {exc}") from exc
+        else:
+            api_key = cfg.get("api_key", "")
+    return api_key or ""
+
+
 @main.command()
 @click.option("--host", default=None, help="Bind host (default: 127.0.0.1 with --ipc or --cftunnel, otherwise 0.0.0.0)")
 @click.option("--port", default=None, type=click.IntRange(0, 65535), help="Bind port (default: 8000; with --ipc, explicitly enables TCP)")
@@ -99,24 +125,12 @@ def run(
     if cwd:
         os.chdir(cwd)
 
-    explicit_key = click.get_current_context().get_parameter_source("api_key") == click.core.ParameterSource.COMMANDLINE
-    if not explicit_key:
-        file_path = os.environ.get("OPEN_TERMINAL_API_KEY_FILE")
-        if "OPEN_TERMINAL_API_KEY" in os.environ and "OPEN_TERMINAL_API_KEY_FILE" in os.environ:
-            raise click.UsageError("OPEN_TERMINAL_API_KEY and OPEN_TERMINAL_API_KEY_FILE are mutually exclusive.")
-        if "OPEN_TERMINAL_API_KEY" in os.environ:
-            api_key = os.environ["OPEN_TERMINAL_API_KEY"]
-        elif file_path:
-            try:
-                with open(file_path) as f:
-                    api_key = f.read().strip()
-            except (OSError, UnicodeError) as exc:
-                raise click.ClickException(f"Could not read API key file: {exc}") from exc
-        else:
-            api_key = cfg.get("api_key", "")
+    api_key = _resolve_api_key(api_key, cfg)
 
     if cftunnel and (not isinstance(api_key, str) or not re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", api_key)):
         raise click.UsageError("--cftunnel requires a configured, nonblank bearer API key. Set --api-key, OPEN_TERMINAL_API_KEY, OPEN_TERMINAL_API_KEY_FILE, or api_key in TOML.")
+    # An explicit empty --api-key skips the env var and _FILE fallbacks in
+    # _resolve_api_key, so re-read the config here.
     if not cftunnel and not api_key:
         api_key = cfg.get("api_key", "")
 
@@ -214,23 +228,59 @@ def run(
     default=None,
     help="Working directory for the server process.",
 )
+@click.option(
+    "--api-key",
+    default="",
+    envvar="OPEN_TERMINAL_API_KEY",
+    help="Bearer API key (or set OPEN_TERMINAL_API_KEY env var)",
+)
 def mcp(
     transport: str,
     host: str | None,
     port: int | None,
     config_path: str | None,
     cwd: str | None,
+    api_key: str | None,
 ):
     """Start the MCP server (requires 'pip install open-terminal[mcp]')."""
+    import secrets
+
     from open_terminal import config
 
     cfg = config.init(config_path)
 
-    host = host or cfg.get("host", "0.0.0.0")
-    port = port if port is not None else cfg.get("port", 8000)
+    # Resolve host/port only for remote transports; stdio needs neither.
+    if transport != "stdio":
+        host = host or cfg.get("host", "0.0.0.0")
+        port = port if port is not None else cfg.get("port", 8000)
 
     if cwd:
         os.chdir(cwd)
+
+    # Resolve the API key before importing mcp_server: env.py evaluates
+    # API_KEY at import time, and main.py refuses to start without one.
+    api_key = _resolve_api_key(api_key, cfg)
+    # An explicit empty --api-key skips the env var and _FILE fallbacks in
+    # _resolve_api_key, so re-read the config here.
+    if not api_key:
+        api_key = cfg.get("api_key", "")
+
+    if transport == "stdio":
+        # stdio is local IPC; a generated key satisfies main.py's check.
+        if not api_key:
+            api_key = secrets.token_urlsafe(48)
+    elif not api_key:
+        # streamable-http serves remote clients; require an explicit key.
+        click.echo(
+            "Error: --api-key is required for streamable-http transport.\n"
+            "Set it via --api-key, OPEN_TERMINAL_API_KEY, OPEN_TERMINAL_API_KEY_FILE, or api_key in TOML.",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    os.environ["OPEN_TERMINAL_API_KEY"] = api_key
+    # The CLI has already resolved _FILE; env.py must not see both sources.
+    os.environ.pop("OPEN_TERMINAL_API_KEY_FILE", None)
 
     try:
         from open_terminal.mcp_server import mcp as mcp_server
@@ -242,7 +292,10 @@ def mcp(
         )
         raise SystemExit(1)
 
-    mcp_server.run(transport=transport, host=host, port=port)
+    if transport == "stdio":
+        mcp_server.run(transport="stdio")
+    else:
+        mcp_server.run(transport=transport, host=host, port=port)
 
 
 if __name__ == "__main__":
